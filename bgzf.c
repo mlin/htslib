@@ -456,35 +456,38 @@ typedef struct bgzf_mtaux_t {
 	worker_t *w;
 	pthread_t *tid;
 	pthread_mutex_t lock;
-	pthread_cond_t cv;
+	pthread_cond_t cv_start, cv_idle;
 } mtaux_t;
-
-static int worker_aux(worker_t *w)
-{
-	int i, stop = 0;
-	// wait for condition: to process or all done
-	pthread_mutex_lock(&w->mt->lock);
-	while (!w->toproc && !w->mt->done)
-		pthread_cond_wait(&w->mt->cv, &w->mt->lock);
-	if (w->mt->done) stop = 1;
-	w->toproc = 0;
-	pthread_mutex_unlock(&w->mt->lock);
-	if (stop) return 1; // to quit the thread
-	w->errcode = 0;
-	for (i = w->i; i < w->mt->background->curr; i += w->mt->n_threads) {
-		int clen = BGZF_MAX_BLOCK_SIZE;
-		if (bgzf_compress(w->buf, &clen, w->mt->background->blk[i], w->mt->background->len[i], w->compress_level) != 0)
-			w->errcode |= BGZF_ERR_ZLIB;
-		memcpy(w->mt->background->blk[i], w->buf, clen);
-		w->mt->background->len[i] = clen;
-	}
-	__sync_fetch_and_add(&w->mt->proc_cnt, 1);
-	return 0;
-}
 
 static void *mt_worker(void *data)
 {
-	while (worker_aux((worker_t*)data) == 0);
+	int i;
+	worker_t *w = (worker_t *) data;
+	while (1) {
+		// wait for condition: to process or all done
+		pthread_mutex_lock(&w->mt->lock);
+		while (!w->toproc && !w->mt->done)
+			pthread_cond_wait(&w->mt->cv_start, &w->mt->lock);
+		w->toproc = 0;
+		pthread_mutex_unlock(&w->mt->lock);
+		if (w->mt->done) break;
+		w->errcode = 0;
+		for (i = w->i; i < w->mt->background->curr; i += w->mt->n_threads) {
+			int clen = BGZF_MAX_BLOCK_SIZE;
+			if (bgzf_compress(w->buf, &clen, w->mt->background->blk[i], w->mt->background->len[i], w->compress_level) != 0)
+				w->errcode |= BGZF_ERR_ZLIB;
+			memcpy(w->mt->background->blk[i], w->buf, clen);
+			w->mt->background->len[i] = clen;
+		}
+		pthread_mutex_lock(&w->mt->lock);
+		w->mt->proc_cnt++;
+		if (w->mt->proc_cnt == w->mt->n_threads) {
+			// I'm the last thread to finish this round of compression. Signal the
+			// main thread that we're now idle.
+			pthread_cond_signal(&w->mt->cv_idle);
+		}
+		pthread_mutex_unlock(&w->mt->lock);
+	}
 	return 0;
 }
 
@@ -493,10 +496,8 @@ int bgzf_mt(BGZF *fp, int n_threads, int n_sub_blks)
 	int i;
 	mtaux_t *mt;
 	pthread_attr_t attr;
-	if (!fp->is_write || fp->mt || n_threads <= 1) return -1;
+	if (!fp->is_write || fp->mt || n_threads < 1) return -1;
 	mt = (mtaux_t*)calloc(1, sizeof(mtaux_t));
-	// # of worker threads not counting the main thread
-	n_threads = n_threads > 1 ? (n_threads-1) : 1;
 	mt->n_threads = n_threads;
 	mt->proc_cnt = n_threads;
 	mt->n_blks = n_threads * n_sub_blks;
@@ -510,7 +511,7 @@ int bgzf_mt(BGZF *fp, int n_threads, int n_sub_blks)
 		mt->background->blk[i] = malloc(BGZF_MAX_BLOCK_SIZE);
 		mt->foreground->blk[i] = malloc(BGZF_MAX_BLOCK_SIZE);
 	}
-	mt->tid = (pthread_t*)calloc(mt->n_threads, sizeof(pthread_t)); // tid[0] is not used, as the worker 0 is launched by the master
+	mt->tid = (pthread_t*)calloc(mt->n_threads, sizeof(pthread_t));
 	mt->w = (worker_t*)calloc(mt->n_threads, sizeof(worker_t));
 	for (i = 0; i < mt->n_threads; ++i) {
 		mt->w[i].i = i;
@@ -521,7 +522,8 @@ int bgzf_mt(BGZF *fp, int n_threads, int n_sub_blks)
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 	pthread_mutex_init(&mt->lock, 0);
-	pthread_cond_init(&mt->cv, 0);
+	pthread_cond_init(&mt->cv_start, 0);
+	pthread_cond_init(&mt->cv_idle, 0);
 	for (i = 0; i < mt->n_threads; ++i)
 		pthread_create(&mt->tid[i], &attr, mt_worker, &mt->w[i]);
 	fp->mt = mt;
@@ -534,9 +536,9 @@ static void mt_destroy(mtaux_t *mt)
 	// signal all workers to quit
 	pthread_mutex_lock(&mt->lock);
 	mt->done = 1; mt->proc_cnt = 0;
-	pthread_cond_broadcast(&mt->cv);
+	pthread_cond_broadcast(&mt->cv_start);
 	pthread_mutex_unlock(&mt->lock);
-	for (i = 1; i < mt->n_threads; ++i) pthread_join(mt->tid[i], 0); // worker 0 is effectively launched by the master thread
+	for (i = 0; i < mt->n_threads; ++i) pthread_join(mt->tid[i], 0);
 	// free other data allocated on heap
 	for (i = 0; i < mt->n_blks; ++i) {
 		free(mt->background->blk[i]);
@@ -546,7 +548,8 @@ static void mt_destroy(mtaux_t *mt)
 	free(mt->background->blk); free(mt->background->len); free(mt->background);
 	free(mt->foreground->blk); free(mt->foreground->len); free(mt->foreground);
 	free(mt->w); free(mt->tid);
-	pthread_cond_destroy(&mt->cv);
+	pthread_cond_destroy(&mt->cv_start);
+	pthread_cond_destroy(&mt->cv_idle);
 	pthread_mutex_destroy(&mt->lock);
 	free(mt);
 }
@@ -575,10 +578,15 @@ static int mt_flush_background(BGZF *fp) {
 	int i;
 	mtaux_t *mt = fp->mt;
 	// wait for all the threads to complete
-	// TODO: replace spinlock with barrier
-	while (mt->proc_cnt < mt->n_threads);
-	// dump data to disk
+	pthread_mutex_lock(&mt->lock);
+	while (mt->proc_cnt < mt->n_threads)
+		pthread_cond_wait(&mt->cv_idle, &mt->lock);
+	pthread_mutex_unlock(&mt->lock);	
 	for (i = 0; i < mt->n_threads; ++i) fp->errcode |= mt->w[i].errcode;
+	// dump data to disk
+	// todo: it would be nice to do this in the last worker thread to finish the
+	//       current compression task. look into whether this would necessitate a
+	//       mutex for fp->fp.
 	for (i = 0; i < mt->background->curr; ++i)
 		if (hwrite(fp->fp, mt->background->blk[i], mt->background->len[i]) != mt->background->len[i])
 			fp->errcode |= BGZF_ERR_IO;
@@ -605,7 +613,7 @@ static int mt_rotate(BGZF *fp) {
 	pthread_mutex_lock(&mt->lock);
 	for (i = 0; i < mt->n_threads; ++i) mt->w[i].toproc = 1;
 	mt->proc_cnt = 0;
-	pthread_cond_broadcast(&mt->cv);
+	pthread_cond_broadcast(&mt->cv_start);
 	pthread_mutex_unlock(&mt->lock);
 
 	return 0;
